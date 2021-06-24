@@ -1,0 +1,2380 @@
+---
+title: "Denmark mortality projections"
+author: "| Marco Gaudio |"
+date: "`r format(Sys.Date(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    highlight: tango
+    keep_md: no
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_float: yes
+  word_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+  github_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(include = TRUE)
+knitr::opts_chunk$set(results = 'hide')
+knitr::opts_chunk$set(error = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(cache = TRUE)
+#knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+This document has the main purpose of developing the academical project of the Pension Funds and Social Security course regarding the mortality projections for Danish population.
+
+The document is divided in 2 main sections:
+
+* **Stochastic mortality models and data**: it provides a description of the tools and data used and the implementation of the models, as well as the criteria used to choose the 3 best models. In addition, a parameters representation is shown for each models.
+
+* **Mortality projections**: it shows the implementation of the projections of the 3 best models, providing an analysis of the uncertainty in mortality projections through the bootstrap procedure. Then, an analysis of the main demographic and actuarial quantities is provided.
+
+
+# Stochastic mortality models and data
+
+## Introduction and Data setting
+
+The first thing to point out is that the data about Denmark used in this project are provided by the [**Human Mortality Database**](https://www.mortality.org/). In this brief introduction are shown the main packages and functions used in the implementation of the project and the choice of the Data Setting for the mortality projections.
+
+```{r, include=TRUE}
+library(demography)
+library(StMoMo)
+library(MTS)
+library(devtools)
+library(writexl)   
+library(readxl)
+source("Functions.r") # uploading functions from an other script in the directory
+library(tidyverse)
+library(ggpubr)
+library(ggthemes)
+library(DT)
+library(fanplot)
+library(lattice)
+```
+
+Below is reported the data setting, that is to say the minimum and maximum age and the relative age interval, the fitting period (50 years), the projection period (100 years), the number of simulation and of bootstraps, a vector of interest rates (assuming it constant) and of discount factors, and finally the data about Denmark loaded from the HMD.
+
+```{r, eval=TRUE}
+# starting age
+a.min <- 0
+# maximum age
+a.max <- 100
+# extreme age
+omega <-110
+# age interval
+A.fit <-c(a.min:a.max)
+# fitting time interval
+y.fit.min <- 1968
+y.fit.max <- 2018
+Y.fit <- c(y.fit.min:y.fit.max)
+# projection interval
+y.pred <- 100
+Y.pred <- c((y.fit.max+1):(y.fit.max+y.pred))
+
+n.sim <- 2500
+n.boot <- 250
+
+# vector of interest rates (flat)
+int_vect <- c(rep(0.02,omega-a.min))
+# vector of discount factors
+v_vect <- cumprod((1+int_vect)^-1)
+
+
+# Demographic Data about Denmark, loaded from HMD.
+Denmark_data <- hmd.mx(country = "DNK",
+                      username = paste0("marcogaudio1997@outlook.it"),
+                      password = 1623581009, label = "Denmark")
+```
+
+
+In order to better understand the dynamics of mortality, we divide the population into male and female. Then, given that the data provided in the HMD are for the central exposed to risk, we need to switch to the initial exposed to risk. Finally, we can specify the weights matrix, useful to exclude some data points when fitting a Stochastic Mortality Model.
+
+```{r}
+
+# distinguish between male and female
+DNKmStMoMoC <- StMoMoData(Denmark_data, series = "male")
+DNKfStMoMoC <- StMoMoData(Denmark_data, series = "female")
+
+# from central exposed to risk to initial exposed to risk
+DNKmStMoMoI <- central2initial(DNKmStMoMoC)
+DNKfStMoMoI <- central2initial(DNKfStMoMoC)
+
+# specify the weights we give to the data: we need to pass age range and time
+# range.
+wxt <- genWeightMat(ages = A.fit, years = Y.fit, clip = 4)
+
+
+```
+
+
+```{r, include=FALSE}
+
+# due to the fact that we have 0 deaths in 2018 for male pop., the log of the quantity below returns -inf. So, this code is to fix this problem, basically it is assumed 2 deaths at age 3 and 8 for last fitted year
+DNKmStMoMoC$Dxt[4,184] <- 2
+DNKmStMoMoC$Dxt[8,184] <- 2
+DNKfStMoMoC$Dxt[5,184] <- 2
+DNKfStMoMoC$Dxt[11,184] <- 2
+
+DNKmStMoMoC$Dxt[which(DNKmStMoMoC$Dxt == 0)] = 2
+
+DNKmStMoMoI <- central2initial(DNKmStMoMoC)
+DNKfStMoMoI <- central2initial(DNKfStMoMoC)
+
+
+```
+
+
+
+Eventually, it is reported the code to compute the death rates for both males and females.
+
+```{r}
+# we DNK get death rates for male and female pop.
+DNKmRates <- DNKmStMoMoC$Dxt/DNKmStMoMoC$Ext
+
+#matrix of the males death rates
+DNKmRates <- DNKmRates[A.fit+1,tail(DNKmStMoMoC$years+1,length(Y.fit))-DNKmStMoMoC$years[1]]
+
+DNKfRates <- DNKfStMoMoC$Dxt/DNKfStMoMoC$Ext
+
+#matrix of the males death rates
+DNKfRates <- DNKfRates[A.fit+1,tail(DNKfStMoMoC$years+1,length(Y.fit))-DNKfStMoMoC$years[1]]
+
+```
+
+## Models fitting
+
+The aim of this section is to fit the different type of stochastic mortality models.
+We will consider the family of generalized age-period-cohort (GAPC) stochastic mortality models. A GAPC model includes:
+
+* **The random component**: the numbers of deaths Dxt follow a Poisson distribution or a
+Binomial distribution, so that: $Dxt\ \sim\ Poisson(E^cxt\ µxt)$, with $E(Dxt /E^cxt) = µxt$ and $E(Dxt/ E^0xt) = qxt$.
+
+* **the systemic component**: the effects of age x, calendar year t and year-of-birth (cohort) $c = t − x$ are captured through a predictor $ηxt$.
+
+
+* **The link function**: associate the random component and the systemic component, so that:
+$g(E(Dxt/Ext)) = ηxt$. 
+Although a number of link functions would be possible, it is convenient to use the so-called canonical link and pair the Poisson distribution with the log link function and
+the Binomial distribution with the logit link function.
+
+* **Set of parameter constraits**:  most stochastic mortality models are only identifiable
+up to a transformation and thus require parameter constraints to ensure unique parameter estimates. These parameter constraints are applied through a constraint function
+which maps an arbitrary vector of parameters $\theta := (\alpha x, \beta^1x,.., \beta^Nx,\beta^0x,k^1xt,..k^Nxt, \gamma t-x)$ into a vector of transformed parameters $v(\theta)= \hat{\theta} = (\hat{\alpha}x, \hat{\beta}^1x,.., \hat{\beta}^Nx,\hat{\beta}^0x,\hat{k}^1xt,..\hat{k}^Nxt, \hat{\gamma}t-x)$ satisfying the model constraints with no effect on the predictor $ηxt$. 
+
+Below are reported the fitted models for both males and females with the package StMoMo. The models fitted are:
+
+* **Lee-Carter model** : it has been implemented considering a Poisson distribution for the number of deaths and using a **log link function** with respect to the force of mortality. The predictor structure proposed by Lee and Carter (1992) assumes that there is a static age function, αx, a unique non-parametric age-period term (N = 1), and no cohort effect.
+
+* **Renshaw and Haberman model** : it is a generalization of the Lee-Carter model by incorporating a cohort effect to obtain the predictor. It assumes a Poisson distribution of deaths and use a logit link to target the force of mortality.
+
+* **age-period-cohort (APC) model**: Another commonly used substructure of the Renshaw and Haberman model is the so-called
+age-period-cohort (APC) model, corresponding to $\beta^1x =1$, $\beta^0x =1$.
+
+
+* **CBD model**: this model proposes a predictor structure with two age-period terms (N=2) with pre-specified age-modulating parameters $\beta^1x =1$ and $\beta^2x = x - \bar{x}$. No static age function and no cohort effect. In order to estimate the parameter of the CBD model it can be assumed a Binomial distribution of deaths using a **logit link function** targeting the one-year death probabilities $qxt$.
+
+* **M7: Quadratic CBD model with cohort effects**: this model is an extention of the original CBD model that consider a term for adding a cohort effect and a quadratic afe effect to obtain the predictor.
+
+* **Plat model**: it combines the CBD model with some features of the Lee-Carter model to produce a model that is suitable for full age ranges and captures the cohort effect. It assumes a static age fucntion $ax$, three age-period terms (N = 3) with pre-specified age modulating parameters $\beta^1x =1$, $\beta^2x = x - \bar{x}$, $\beta^3x = (\bar{x} - x)^+$, and a cohort effect with pre-specified age-modulating parameters $\beta^0x = 1$. It is used a log link and a Poisson distribution for the deaths.
+```{r, eval = TRUE}
+# log link 
+LCfit_DNKm <- fit(lc(link = "log"),
+                  data = DNKmStMoMoC,
+                  ages.fit = a.min:a.max,
+                  years.fit = y.fit.min:y.fit.max,
+                  wxt = wxt)
+
+LCfit_DNKf <- fit(lc(link = "log"),
+                  data = DNKfStMoMoC,
+                  ages.fit = a.min:a.max,
+                  years.fit = y.fit.min:y.fit.max,
+                  wxt = wxt)
+
+# in RH model we need to specify an initial value for alpha and beta.
+# one of the problem of this model is that it is slow to be fitted.
+# we use the starting value of LC to initialize the algo.
+RHfit_DNKm <- fit(rh(link = "logit", cohortAgeFun="1"),
+                  data = DNKmStMoMoI,
+                  ages.fit = a.min:a.max,
+                  years.fit=y.fit.min:y.fit.max,
+                  wxt = wxt,
+                  start.ax = LCfit_DNKm$ax,
+                  start.bx = LCfit_DNKm$bx,
+                  start.kt = LCfit_DNKm$kt)
+
+RHfit_DNKf <- fit(rh(link = "logit", cohortAgeFun="1"),
+                  data = DNKfStMoMoI,
+                  ages.fit = a.min:a.max,years.fit=y.fit.min:y.fit.max,
+                  wxt = wxt,
+                  start.ax = LCfit_DNKf$ax,
+                  start.bx = LCfit_DNKf$bx,
+                  start.kt = LCfit_DNKf$kt)
+
+APCfit_DNKm <- fit(apc(link = "logit"),
+                   data = DNKmStMoMoI,
+                   ages.fit = a.min:a.max,
+                   years.fit=y.fit.min:y.fit.max,
+                   wxt = wxt)
+
+APCfit_DNKf <- fit(apc(link = "logit"),
+                   data = DNKfStMoMoI,
+                   ages.fit = a.min:a.max,
+                   years.fit = y.fit.min:y.fit.max,
+                   wxt = wxt)
+
+CBDfit_DNKm <- fit(cbd(),
+                   data = DNKmStMoMoI,
+                   ages.fit = a.min:a.max,
+                   years.fit = y.fit.min:y.fit.max,
+                   wxt = wxt)
+
+CBDfit_DNKf <- fit(cbd(),
+                   data = DNKfStMoMoI,
+                   ages.fit = a.min:a.max,
+                   years.fit = y.fit.min:y.fit.max,
+                   wxt = wxt)
+
+M7fit_DNKm <- fit(m7(link = "logit"),
+                  data = DNKmStMoMoI,
+                  ages.fit = a.min:a.max,
+                  years.fit = y.fit.min:y.fit.max,
+                  wxt = wxt)
+
+M7fit_DNKf <- fit(m7(link = "logit"),
+                  data = DNKfStMoMoI,
+                  ages.fit = a.min:a.max,
+                  years.fit = y.fit.min:y.fit.max,
+                  wxt = wxt)
+
+# the function PLAT is defined in the scirpt functions.R
+PLATfit_DNKm <- fit(PLAT, data = DNKmStMoMoI,
+                    ages.fit = a.min:a.max,
+                    years.fit = y.fit.min:y.fit.max,
+                    wxt = wxt)
+
+PLATfit_DNKf <- fit(PLAT, data = DNKfStMoMoI,
+                    ages.fit = a.min:a.max,
+                    years.fit = y.fit.min:y.fit.max,
+                    wxt = wxt)
+
+
+```
+
+
+## Model comparison
+
+In this section the models are analyzed in order to better understand which of them is more suitable to be adopted for the mortality projections.
+First of all, the parameters of the GAPC stochastic mortality models can be obtained by maximizing the model **Log-likelihood**, that is one of the output of the function *fit()* previously used.
+
+```{r, results='hold'}
+LL <- tibble(Gender = c("Male", "Female"), 
+             Lee_Carter = c(LCfit_DNKm$loglik, LCfit_DNKf$loglik),
+             Renshaw_Haberman = c(RHfit_DNKm$loglik, RHfit_DNKm$loglik),
+             APC = c(APCfit_DNKm$loglik, APCfit_DNKm$loglik),
+             CBD = c(CBDfit_DNKm$loglik, CBDfit_DNKf$loglik),
+             M7 = c(M7fit_DNKm$loglik, M7fit_DNKf$loglik),
+             Plat = c(PLATfit_DNKm$loglik, PLATfit_DNKm$loglik))
+LL
+```
+
+It is worth noting that the best model according to the maximization of the log-likelihood (for both males and females) are in order: **Renshaw-Habernan**; **Plat** and **Lee-Carter** for female and **APC** for male.
+
+The problem with the log-likelihood is that it does not consider the number of parameters of the model. Indeed, it is generally known that models with more parameters provide a better fit to the data. But, to discard the possibility that a better fit is the result of over-parametrization and to compare the relative performance of several models, it is common to use **information criteria** which modify the maximum likelihood criterion by penalizing model with more parameters. Two of these criteria are **Akaike Information Criteria (AIC)** and **Bayesian Information Criteria (BIC)**. For both of them we prefer a lower value due to the change of sign of the log-likelihood in their formula. Below are reported both the criteria for the fitted models.
+
+
+```{r, results='hold'}
+info_criteria_male <- tibble(
+                        Criteria = c("BIC", "AIC", "n.parameters"),
+                         Lee_Carter = c(BIC(LCfit_DNKm), AIC(LCfit_DNKm),
+                                        LCfit_DNKm$npar),
+             Renshaw_Haberman = c(BIC(RHfit_DNKm), AIC(RHfit_DNKm),
+                                  RHfit_DNKm$npar),
+             APC = c(BIC(APCfit_DNKm), AIC(APCfit_DNKm), APCfit_DNKm$npar),
+             CBD = c(BIC(CBDfit_DNKm), AIC(CBDfit_DNKm), CBDfit_DNKm$npar),
+             M7 = c(BIC(M7fit_DNKm), AIC(M7fit_DNKm), M7fit_DNKm$npar),
+             Plat = c(BIC(PLATfit_DNKm), AIC(PLATfit_DNKm),
+                      PLATfit_DNKm$npar))
+
+info_criteria_female <- tibble(
+                        Criteria = c("BIC", "AIC", "n.parameters"),
+                         Lee_Carter = c(BIC(LCfit_DNKf), AIC(LCfit_DNKf),
+                                        LCfit_DNKf$npar),
+             Renshaw_Haberman = c(BIC(RHfit_DNKf), AIC(RHfit_DNKf),
+                                  RHfit_DNKf$npar),
+             APC = c(BIC(APCfit_DNKf), AIC(APCfit_DNKf), APCfit_DNKf$npar),
+             CBD = c(BIC(CBDfit_DNKf), AIC(CBDfit_DNKf), CBDfit_DNKf$npar),
+             M7 = c(BIC(M7fit_DNKf), AIC(M7fit_DNKf), M7fit_DNKf$npar),
+             Plat = c(BIC(PLATfit_DNKf), AIC(PLATfit_DNKf),
+                      PLATfit_DNKf$npar))
+info_criteria_male
+info_criteria_female
+
+```
+
+For female danish population, according to AIC and BIC the best models are respectively Renshaw-Haberman, Plat and Lee-Carter, and Renshaw-Haberman, Plat and APC. The situation is different for male population, given that according to both AIC and BIC, the best models are Renshaw-Haberman, Plat and APC. Even though the RH model was the best according to these criteria it has a very large number of parameters, so, from now on the models considered are the Lee-Carter, due to its advantages,among which are its simplicity and that the parameters are parsimonious and easily interpretable; the PLAT model and the APC model, that is to say, the ones with the best performances.
+
+## Residuals {.tabset}
+Additionally, we can detect the residuals of the fitted model in order to analyzed the goodness-of-fit. This can be done by applying the function *residuals()* to the fit object. Here are only considered the residuals for the 3 models that have performed better previously. In order to use the package *ggplot*, it is needed to reshape the data, this is done through the function *reshape_heatmap()*, that can be found in the file *Functions.R*.
+
+Marked diagonals patterns indicating the inability of these models to capture the well-known cohort effect, while random patterns is the ideal condition. As shown by the 
+graphs, the Lee-Carter model residuals show some patterns, this is due to the fact that it does not incorporate a term for the cohort effect. The residuals of the Renshaw-Haberman model and Plat model look instead random. 
+
+### Lee-Carter 
+```{r, results='hold'}
+
+LCres_DNKm <- residuals(LCfit_DNKm)
+LCres_DNKf <- residuals(LCfit_DNKf)
+
+
+# this function DNK be found in the R script Function.R
+reshape_heatmap <- function(residuals, ages){
+  
+  data_heatmap <- tibble(as.data.frame(residuals)) %>% 
+    pivot_longer(cols = `1968`:`2018`) %>% 
+    rename(years = "name",
+           residuals = "value") %>% 
+    arrange(years) %>%
+    mutate(ages = rep(ages,51))
+    data_heatmap$years <- as.numeric(data_heatmap$years)
+    
+  return(data_heatmap)
+}
+
+data_LC_male <- reshape_heatmap(LCres_DNKm$residuals, 
+                                     LCres_DNKm$ages)
+data_LC_female <- reshape_heatmap(LCres_DNKf$residuals,
+                                       LCres_DNKf$ages)
+
+male_plot <- ggplot(data = data_LC_male, aes(x = years, 
+                        y = ages,
+                        fill = residuals)) + 
+  geom_tile() + 
+  scale_fill_distiller(palette = "Blues") + 
+  labs(subtitle = "Lee-Carter residuals, Male") + 
+  theme_economist() + 
+  scale_x_continuous(breaks=seq(1970, 2010, 10)) + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+  female_plot <- ggplot(data = data_LC_female, aes(x = years, 
+                        y = ages,
+                        fill = residuals)) + 
+  geom_tile() + 
+  scale_fill_distiller(palette = "Blues") + 
+  labs(subtitle = "Lee-Carter residuals, Female" )+ 
+  theme_economist() + 
+  scale_x_continuous(breaks=seq(1970, 2010, 10)) + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+ggarrange(female_plot, male_plot) 
+
+```
+
+### APC 
+```{r,results='hold'}
+
+APCres_DNKm <- residuals(APCfit_DNKm)
+APCres_DNKf <- residuals(APCfit_DNKf)
+
+
+# this function DNK be found in the R script Function.R
+reshape_heatmap <- function(residuals, ages){
+  
+  data_heatmap <- tibble(as.data.frame(residuals)) %>% 
+    pivot_longer(cols = `1968`:`2018`) %>% 
+    rename(years = "name",
+           residuals = "value") %>% 
+    arrange(years) %>%
+    mutate(ages = rep(ages,51))
+    data_heatmap$years <- as.numeric(data_heatmap$years)
+    
+  return(data_heatmap)
+}
+
+data_APC_male <- reshape_heatmap(APCres_DNKm$residuals, 
+                                     APCres_DNKm$ages)
+data_APC_female <- reshape_heatmap(APCres_DNKf$residuals,
+                                       APCres_DNKf$ages)
+
+male_plot <- ggplot(data = data_APC_male, aes(x = years, 
+                        y = ages,
+                        fill = residuals)) + 
+  geom_tile() + 
+  scale_fill_distiller(palette = "Blues") + 
+  labs(subtitle = "Lee-Carter residuals, Male") + 
+  theme_economist() + 
+  scale_x_continuous(breaks=seq(1970, 2010, 10)) + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+  female_plot <- ggplot(data = data_APC_female, aes(x = years, 
+                        y = ages,
+                        fill = residuals)) + 
+  geom_tile() + 
+  scale_fill_distiller(palette = "Blues") + 
+  labs(subtitle = "Lee-Carter residuals, Female" )+ 
+  theme_economist() + 
+  scale_x_continuous(breaks=seq(1970, 2010, 10)) + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+ggarrange(female_plot, male_plot) 
+          
+```
+
+### Plat
+
+```{r, results='hold'}
+
+PLATres_DNKm <- residuals(PLATfit_DNKm)
+PLATres_DNKf <- residuals(PLATfit_DNKf)
+
+data_PLAT_male <- reshape_heatmap(PLATres_DNKm$residuals, 
+                                     PLATres_DNKm$ages)
+data_PLAT_female <- reshape_heatmap(PLATres_DNKf$residuals,
+                                       PLATres_DNKf$ages)
+
+male_plot <- ggplot(data = data_PLAT_male, aes(x = years, 
+                        y = ages,
+                        fill = residuals)) + 
+  geom_tile() + 
+  scale_fill_distiller(palette = "Blues") + 
+  labs(subtitle = "PLAT residuals, Male") + 
+  theme_economist() + 
+  scale_x_continuous(breaks=seq(1970, 2010, 10)) +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+female_plot <- ggplot(data = data_PLAT_female, aes(x = years, 
+                        y = ages,
+                        fill = residuals)) + 
+  geom_tile() + 
+  scale_fill_distiller(palette = "Blues") + 
+  labs(subtitle = "PLAT residuals, Female") + 
+  theme_economist() + 
+  scale_x_continuous(breaks=seq(1970, 2010, 10)) +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+ggarrange(female_plot, male_plot)
+
+```
+
+
+
+## Residuals by age and calendar year {.tabset}
+Below are reported the plots for the residuals by ages and calendar years. As shown, none of the models seem to have particular pattern (for both male and female).
+
+### Lee-Carter
+
+
+```{r, results='hold'}
+
+res_cy_m <- ggplot(data = data_LC_male, aes(x = years, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "Lee-Carter residuals for calendar year, Male" )+ 
+  theme(legend.position = "right",
+                         axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+res_cy_f <- ggplot(data = data_LC_female, aes(x = years, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "Lee-Carter residuals for calendar year, Female" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+
+# residuals lee carter by calendar year, male and female
+
+res_age_m <- ggplot(data = data_LC_male, aes(x = ages, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "Lee-Carter residuals for ages, Male" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+res_age_f <- ggplot(data = data_LC_female, aes(x = ages, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "Lee-Carter residuals for ages, Female" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(res_age_f,res_age_m, res_cy_m, res_cy_f)
+
+
+
+
+```
+
+### APC
+
+```{r}
+
+
+res_cy_m <- ggplot(data = data_APC_male, aes(x = years, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "APC residuals for calendar year, Male" )+ 
+  theme(legend.position = "right",
+                         axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+res_cy_f <- ggplot(data = data_APC_female, aes(x = years, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "APC residuals for calendar year, Female" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+
+# residuals lee carter by calendar year, male and female
+
+res_age_m <- ggplot(data = data_APC_male, aes(x = ages, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "APC residuals for ages, Male" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+res_age_f <- ggplot(data = data_APC_female, aes(x = ages, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "APC residuals for ages, Female" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(res_age_f,res_age_m, res_cy_m, res_cy_f)
+
+```
+
+
+### PLAT 
+
+```{r, results='hold'}
+
+res_cy_m <- ggplot(data = data_PLAT_male, aes(x = years, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "PLAT residuals for calendar year, Male" )+ 
+  theme(legend.position = "right",
+                         axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+res_cy_f <- ggplot(data = data_PLAT_female, aes(x = years, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "PLAT residuals for calendar year, Female" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+
+# residuals lee carter by calendar year, male and female
+
+res_age_m <- ggplot(data = data_PLAT_male, aes(x = ages, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "PLAT residuals for ages, Male" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+res_age_f <- ggplot(data = data_PLAT_female, aes(x = ages, y = residuals)) +
+  geom_point() +
+  theme_economist() + 
+  labs(subtitle = "PLAT residuals for ages, Female" )+ 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(res_age_f,res_age_m, res_cy_m, res_cy_f)
+
+
+
+```
+
+
+## Parameters representation {.tabset}
+
+This section will present the evolution of the parameters for the 3 models selected: Lee-Carter, APC and Plat model. Even in this case, it has been used the package ggplot to produce the graphs. The parameters are: 
+
+* **$\alpha x$**, represents the general shape of the mortality.
+
+* **$\beta x$**, represents the age-specific patterns of mortality changes. It indicates the sensitivity of the logarithm of the force of mortality at age x to variations in the time index $kt$.
+
+* **$kt$**, describes the mortality trend over time.
+
+* **$\gamma t-x$** represents the *cohort effect*, the effect of having been born in a certain time.
+
+
+As already said, $\alpha x$ represents the shape of mortality. In the LC model, it is shown, for both male and female, a high value at birth, then there is a decrease for younger ages up to 10-15 years, and then a slight increase, before staying constant between ages 20-35. Then, as soon as we consider older age, it increases and becomes steeper. There is a similar behaviour for the $\alpha x$ parameter for both the PLAT and APC model.
+The $\beta x$ parameter shows the reaction of the ages to the changes over time of mortality (kt). This term is only present in the Lee-Carter model. As shown, there is a strong reaction at birth and for young ages, then there is a good reaction between 40 and 65 (even though there are some spikes) and near age 75. For older ages the reaction is small. 
+The $kt$ parameter tracks mortality changes over time. It is shown in all the models, for the Lee-Carter, there is a quite good reduction over time, for both male and female,  even though for male population there is a sudden increase around 1980. The same is true for female population between 1990 and 2000. The same behavior is presented by the PLAT and APC model.
+Finally, the $\gamma$ parameter includes the cohort effect. It is present in both the PLAT and APC model. With respect to the first one, there is an important increase for cohorts in the period 1940-1950 and 1925-1930(unlucky cohort) for both male and female.There is a slight decrease in between 1900 and 1910(lucky cohort). Regarding the APC model, for both male and female there is a huge peak around 1930, but in general the trend is increasing for both male and female.
+
+
+### Lee-Carter 
+```{r}
+# even in this case, we need to reshape the data
+lee_carter_params <- tibble(ages =  as.numeric(LCfit_DNKm$ages),
+                            ax_male = LCfit_DNKm$ax,
+                            bx_male = as.numeric(LCfit_DNKm$bx),
+                            ax_female = LCfit_DNKf$ax,
+                            bx_female = as.numeric(LCfit_DNKf$bx))
+
+kt_lee_carter <- tibble(kt_male = as.numeric(LCfit_DNKm$kt),
+                        kt_female = as.numeric(LCfit_DNKf$kt),
+                        years = LCfit_DNKm$years)
+
+
+
+ax_m <- ggplot(data = lee_carter_params, aes(x = ages, y = ax_male)) +
+  geom_line() +
+  xlab("AGE") +
+  ylab("ax") +
+  labs(subtitle = "alpha plot, Male")  + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+bx_m <- ggplot(data = lee_carter_params, aes(x = ages, y = bx_male)) +
+  geom_line() +
+  xlab("AGE") +
+  ylab("bx") +
+  labs(subtitle = "beta plot, Male") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+kt_m <- ggplot(data = kt_lee_carter, aes(x = years , y = kt_male)) +
+  geom_line() +
+  xlab("YEARS") +
+  ylab("bx") +
+ labs(subtitle = "kt plot, Male") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+ax_f <- ggplot(data = lee_carter_params, aes(x = ages, y = ax_female)) +
+  geom_line() +
+  xlab("AGE") +
+  ylab("ax") +
+ labs(subtitle = "alpha plot, Female") + 
+  theme_economist()
+
+bx_f <- ggplot(data = lee_carter_params, aes(x = ages, y = bx_female)) +
+  geom_line() +
+  xlab("AGE") +
+  ylab("bx") +
+  labs(subtitle = "beta plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+kt_f <- ggplot(data = kt_lee_carter, aes(x = years , y = kt_female)) +
+  geom_line() +
+  xlab("YEARS") +
+  ylab("bx") +
+  labs(subtitle = "kt plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+ggarrange(ax_m, bx_m, kt_m, ax_f, bx_f, kt_f)
+```
+
+
+### APC
+```{r, results='hold'}
+APC_params <- tibble(ages = as.numeric(APCfit_DNKm$ages), 
+                    ax_male = APCfit_DNKm$ax,
+                    ax_female = APCfit_DNKf$ax)
+
+kt_APC <- tibble(kt1_male = as.numeric(APCfit_DNKm$kt),
+                kt1_female = as.numeric(APCfit_DNKf$kt),
+                years = APCfit_DNKm$years)
+
+gc_APC <- tibble(gc_male = APCfit_DNKm$gc[1:101], 
+                gc_female = APCfit_DNKf$gc[1:101],
+                cohorts = APCfit_DNKm$cohorts[1:101])
+
+ax_m <- ggplot(data = APC_params, aes(x = ages, y = ax_male)) + 
+  geom_line() + 
+  labs(subtitle = "alpha plot, Male") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+ax_f <- ggplot(data = APC_params, aes(x = ages, y = ax_female)) + 
+  geom_line() + 
+  labs(subtitle = "alpha plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+kt1_m <- ggplot(data = kt_APC, aes(x = years, y = kt1_male)) + 
+  geom_line() + 
+  labs(subtitle = "kt plot, Male", x = "YEARS") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+kt1_f <- ggplot(data = kt_APC, aes(x = years, y = kt1_female)) + 
+  geom_line() + 
+  labs(subtitle = "kt plot, Female", x = "YEARS") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+gc_m <- ggplot(data = gc_APC, aes(x = cohorts, y = gc_male)) + 
+  geom_line() + 
+  labs(subtitle = "gamma plot, Male") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+gc_f <- ggplot(data = gc_APC, aes(x = cohorts, y = gc_female)) + 
+  geom_line() + 
+  labs(subtitle = "gamma plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+ggarrange(ax_m, ax_f, kt1_m, kt1_f, gc_m, gc_f)
+
+```
+
+### Plat
+```{r, results='hold'}
+PLAT_params <- tibble(ages = as.numeric(PLATfit_DNKm$ages),
+                      ax_male = PLATfit_DNKm$ax,
+                      ax_female = PLATfit_DNKf$ax)
+
+kt_PLAT <- tibble(kt1_male = as.numeric(PLATfit_DNKm$kt[1,]),
+                     kt2_male = as.numeric(PLATfit_DNKm$kt[2,]),
+                     kt1_female = as.numeric(PLATfit_DNKf$kt[1,]),
+                     kt2_female = as.numeric(PLATfit_DNKf$kt[2,]),
+                     years = PLATfit_DNKm$years)
+
+gc_PLAT <- tibble(gc_male = PLATfit_DNKm$gc[1:101], 
+                  gc_female = PLATfit_DNKf$gc[1:101],
+                  cohorts = PLATfit_DNKm$cohorts[1:101])
+
+
+ax_m <- ggplot(data = PLAT_params, aes(x = ages, y = ax_male)) + 
+  geom_line() + 
+  labs(subtitle = "alpha plot, Male") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+ax_f <- ggplot(data = PLAT_params, aes(x = ages, y = ax_female)) + 
+  geom_line() + 
+  labs(subtitle = "alpha plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+kt1_m <- ggplot(data = kt_PLAT, aes(x = years, y = kt1_male)) + 
+  geom_line() + 
+  labs(subtitle = "Kt1 plot, Male") +
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+kt1_f <- ggplot(data = kt_PLAT, aes(x = years, y = kt1_female)) + 
+  geom_line() + 
+  labs(subtitle = "Kt1 plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+kt2_m <- ggplot(data = kt_PLAT, aes(x = years, y = kt2_male)) + 
+  geom_line() + 
+  labs(subtitle = "Kt2 plot, Male") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+kt2_f <- ggplot(data = kt_PLAT, aes(x = years, y = kt2_female)) + 
+  geom_line() + 
+  labs(subtitle = "Kt2 plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+gc_m <- ggplot(data = gc_PLAT, aes(x = cohorts, y = gc_male)) + 
+  geom_line() + 
+  labs(subtitle = "gamma plot, Male") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+gc_f <- ggplot(data = gc_PLAT, aes(x = cohorts, y = gc_female)) + 
+  geom_line() + 
+  labs(subtitle = "gamma plot, Female") + 
+  theme_economist() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+ggarrange(ax_m, ax_f, kt1_m, kt1_f, kt2_m, kt2_f, gc_m, gc_f)
+
+
+```
+
+# Mortality projections
+
+In this section are used the 3 models choosen previously in order to make projections about mortality in Denmark. Recall that the projection period initially set is 100 years (2018-2118).
+Of crucial importance for the dynamics of the mortality in the family of GAPC stochastic mortality models are the period indexes $kt$, and the cohort indexes. There are two main possibilities: assume that the period indexes follow a multivariate random walk with drift; assume that the individual period indexes follow a general univariate **ARIMA model**. For the cohort index it is assumed that it follows a univariate ARIMA process which is independent of the period index $kt$.
+
+## Lee-Carter model
+
+First of all it is needed to use the function *forecast()* to get the forecasts of the Lee-Carter model previously fitted. For this model it is assumed that the period indexes follow independent univariate ARIMA (1,1,2) models, as suggested by stMoMo vignette. Then it is shown a fan chart that represents the forecast for the period indexes, with a central forecast and a 95% prediction intervals(respectively for male and female danish population).
+
+```{r, results='hold'}
+# male forecasts
+LCfor_DNKm <- forecast(LCfit_DNKm, h=y.pred, kt.method = "iarima",  kt.order =
+                         c(1, 1, 2))
+#female forecasts
+LCfor_DNKf <- forecast(LCfit_DNKf, h=y.pred, kt.method = "iarima",  kt.order =
+                         c(1, 1, 2))
+
+plot(LCfor_DNKm, only.kt = TRUE)
+plot(LCfor_DNKf, only.kt = TRUE)
+
+
+```
+
+
+
+
+### Death rates: last observed vs last projected
+Additionally, it can be represented the evolution of the death rates of the last observed year(2018) compared to the last projected year (2118).
+```{r, results='hold'}
+
+
+data_death_rates <- tibble(Ages = c(a.min:a.max), 
+                           last_pred_m=log(LCfor_DNKm$rates[,y.pred]),
+                           last_fit_m=log((LCfit_DNKm$Dxt/LCfit_DNKm$Ext)[,length(Y.fit)]),
+                           last_pred_f=log(LCfor_DNKf$rates[,y.pred]),
+                           last_fit_f=log((LCfit_DNKf$Dxt/LCfit_DNKf$Ext)[,length(Y.fit)])) 
+
+male_death_rates <- ggplot(data = data_death_rates, aes(x = Ages,
+                                     y = last_pred_m), color = "blue") +
+  geom_line() + 
+  
+  xlab("Ages") + 
+  ylab("Death rates") + 
+  theme_economist() +
+  geom_line(data = data_death_rates, aes(x =Ages,
+                           y=last_fit_m),
+            color = "darkcyan", linetype = "dotted") + 
+  labs(subtitle = "evolution of death rates, Female",
+       color = "Legend") 
+  
+
+
+female_death_rates <- ggplot(data = data_death_rates, aes(x = Ages,
+                                     y = last_pred_f), color = "blue") +
+  geom_line() + 
+  
+  xlab("Ages") + 
+  ylab("Death rates") + 
+  theme_economist() +
+  geom_line(data = data_death_rates, aes(x =Ages,
+                           y=last_fit_f),
+            color = "darkcyan", linetype = "dotted") + 
+  labs(subtitle = "evolution of death rates, Male",
+       color = "Legend") 
+
+
+ggarrange(male_death_rates, female_death_rates)
+
+```
+
+
+As we can observe, the dotted line refers to the 2018, while the continuous line refers to the last projected year, 2118. There is a huge decrease for very young population and between 40 and 55, but for older population there is almost 0 improvement. Similar considerations can be done for female population.
+
+
+Beside, the central deaths rates(for both fitted and projected periods) are obtained. From these, the death probabilities are computed. The problem is that we consider mortality only up to age of 100, but in actuarial valuation it is important to consider also population over that age, even though very small. A possible solution is to use an extrapolation approach. Death probabilities for ages greater than 100 are obtained via extrapolation, starting from the assumption of a logit transform of qx, and assuming that the evolution of mortality between a minimum and a maximum ages (90 and 100) can be obtained by a simple linear model. Then this model is fitted and the death probabilities are extrapolate until age omega. Finally, we add this extrapolated data to the original data. 
+
+```{r, results='hold'}
+# male death rates
+rates_LCfit_DNKm <- fitted(LCfit_DNKm, type = "rates")
+rates_LCfor_DNKm <- LCfor_DNKm$rates
+rates_LC_DNKm <- cbind(DNKmRates,rates_LCfor_DNKm) # observed vs forcasted rates
+
+# starting from rates, we DNK obtain the death probs
+q_LC_DNKm <- 1- exp(-rates_LC_DNKm) # for both past and future
+
+# in order to consider also this pop, we use an extrapolation 
+q_LC_DNKm.ext  <- extrapolation.fit(q_LC_DNKm)
+
+# female death rates
+rates_LCfit_DNKf <- fitted(LCfit_DNKf, type = "rates")
+rates_LCfor_DNKf <- LCfor_DNKf$rates
+
+rates_LC_DNKf <- cbind(DNKfRates,rates_LCfor_DNKf)
+q_LC_DNKf <- 1- exp(-rates_LC_DNKf)
+q_LC_DNKf.ext  <- extrapolation.fit(q_LC_DNKf)
+
+# create the dataframes
+
+q_LC.DNKm<-tibble(as.data.frame(q_LC_DNKm.ext))
+q_LC.DNKf<-tibble(as.data.frame(q_LC_DNKf.ext))
+
+   
+
+
+
+```
+
+
+
+
+
+
+### Survival Probabilities and Life expectancies
+
+From death probabilities we can obtain 1 year survival probabilities and survival probabilities for many years as well. Then, below is reported the evolution of the life expectancy at age 0 and 65, for the fitted period as well as the projected one.
+
+```{r, results='hold'}
+# one-year survival probability
+p_LC_DNKm.ext <- 1-q_LC_DNKm.ext 
+# n year survival probability
+p0n_LC_DNKm.ext <- apply(p_LC_DNKm.ext, 2, cumprod) 
+# from death prob we DNK also obtain life expectancy
+ex_LC_DNKm.ext <- life.exp(q_LC_DNKm.ext)
+
+# the same we DNK do for females
+p_LC_DNKf.ext <- 1-q_LC_DNKf.ext 
+p0n_LC_DNKf.ext <- apply(p_LC_DNKf.ext, 2, cumprod) 
+ex_LC_DNKf.ext <- life.exp(q_LC_DNKf.ext)
+
+```
+
+
+```{r, results='hold'}
+
+E_birth_m <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_LC_DNKm.ext[1,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at birth, Male") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+E_65_m <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_LC_DNKm.ext[66,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at 65, Male") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+
+E_birth_f <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_LC_DNKf.ext[1,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at birth, Female") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+E_65_f <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_LC_DNKf.ext[66,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at 65, Female") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+ggarrange(E_birth_m, E_65_m, E_birth_f, E_65_f)
+
+
+```
+
+
+As known, the Lee-Carter does not catch the negative shocks of mortality due to adverse events (epidemics, adverse climate change, ecc..). Indeed, the life expectancy evolutions follow a linear pattern.
+
+### Evolution of death rates
+Up to now it has been considered only the central evolution of death rates. Below are reported the simulated evolution of deaths rates, with the corresponding simulated death probabilities. Then, the evolution of death rates at age 65, 75 and 85 is plotted.
+
+```{r}
+#male
+LCsim_DNKm.mrwd <- simulate(LCfit_DNKm, nsim = n.sim,
+                            h=y.pred
+                            # , 
+                            # kt.method = "iarima", 
+                            # kt.order = NULL
+                            )
+rates_LC_DNKm.st <- LCsim_DNKm.mrwd$rates
+q_LC_DNKm.st <- 1- exp(-rates_LC_DNKm.st)
+q_LC_DNKm.st.ext <-  extrapolation.sim(q_LC_DNKm.st)
+
+# female
+LCsim_DNKf.mrwd <- simulate(LCfit_DNKf, nsim = n.sim,
+                            h=y.pred, kt.method = "iarima", 
+                            kt.order = NULL)
+rates_LC_DNKf.st <- LCsim_DNKf.mrwd$rates
+q_LC_DNKf.st <- 1- exp(-rates_LC_DNKf.st)
+q_LC_DNKf.st.ext <-  extrapolation.sim(q_LC_DNKf.st)
+
+# fun charts
+probs = c(2.5, 10, 25, 50, 75, 90, 97.5)
+par(mfrow=c(1, 2))
+matplot(LCfit_DNKm$years,
+        t(q_LC_DNKm[c("65", "75", "85"),
+                    c(1:length(Y.fit)) ]),
+        xlim = c(y.fit.min, (y.fit.min+y.pred)),
+        ylim = c(0.001, 0.2),
+        pch = 20, col = "black",
+        log = "y",
+        xlab = "year",
+        ylab = "male mortality rate (log scale)")
+fan(t(LCsim_DNKm.mrwd$rates["65", , ]),
+    start = y.fit.max+1,
+    probs = probs, n.fan = 4,
+    fan.col = colorRampPalette(c("black", "white")),
+    ln = NULL)
+fan(t(LCsim_DNKm.mrwd$rates["75", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("red", "white")),
+    ln = NULL)
+fan(t(LCsim_DNKm.mrwd$rates["85", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("blue", "white")),
+    ln = NULL)
+text(y.fit.min+4,
+     q_LC_DNKm[c("65", "75", "85"), 30],
+     labels = c("x = 65", "x = 75", "x = 85"))
+matplot(LCfit_DNKf$years,
+        t(q_LC_DNKf[c("65", "75", "85"),
+                    c(1:length(Y.fit)) ]),
+        xlim = c(y.fit.min, (y.fit.min+y.pred)),
+        ylim = c(0.001, 0.2),
+        pch = 20, col = "black",
+        log = "y", xlab = "year", ylab = "female mortality rate (log scale)")
+fan(t(LCsim_DNKf.mrwd$rates["65", , ]),
+    start = y.fit.max+1,
+    probs = probs, n.fan = 4,
+    fan.col = colorRampPalette(c("black", "white")),
+    ln = NULL)
+fan(t(LCsim_DNKf.mrwd$rates["75", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("red", "white")),
+    ln = NULL)
+fan(t(LCsim_DNKf.mrwd$rates["85", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("blue", "white")), ln = NULL)
+text(y.fit.min+4,
+     q_LC_DNKf[c("65", "75", "85"), 30],
+     labels = c("x = 65", "x = 75", "x = 85"))
+
+```
+
+According to the figure, for both male and female danish population, the fan charts for age 85 are a bit narrower than the age 65, this would suggest that the forecasts with Lee-Carter model are not so plausible for the danish population.
+
+
+### Bootstrap 
+
+When analyzing the uncertainty in mortality projections in an actuarial context it is important to consider all sources of risk. However, the prediction intervals (fan charts) obtained in
+the previous section only account for the uncertainty arising from the error in the forecast of the period and cohort indexes and ignore the uncertainty arising from the estimation of the
+parameters of the GAPC model. Due to the analytical intractability of many stochastic mortality models, parameter uncertainty is typically accounted for using the bootstrap procedure. The key idea behind the bootstrap is to resample from the original data in order to replicate datasets, from which variability of the demographic and actuarial quantities of interest can be assessed. To sample the parameters of the models, the **semiparametric boostrap** has been used. First $B$ samples are extracted from the number of deaths (from Poisson Distribution with mean $dxt$), then each bootstrap is used to re-estimate the model to obtain $B$ parameter estimates. Note that the bootstrap is a computationally intensive procedure that takes some time to run. 
+
+```{r}
+LCboot_DNKm <- bootstrap(LCfit_DNKm,
+                         nBoot = n.boot,
+                         type = "semiparametric")
+LCsim_DNKm.boot <- simulate(LCboot_DNKm, nsim = n.sim/n.boot, h = y.pred)
+rates_LC_DNKm.boot.st <- LCsim_DNKm.boot$rates
+q_LC_DNKm.boot.st <- 1- exp(-rates_LC_DNKm.boot.st)
+q_LC_DNKm.boot.st.ext <-  extrapolation.sim(q_LC_DNKm.boot.st)
+
+LCboot_DNKf <- bootstrap(LCfit_DNKf,
+                         nBoot = n.boot,
+                         type = "semiparametric")
+LCsim_DNKf.boot <- simulate(LCboot_DNKf, nsim = n.sim/n.boot, h = y.pred)
+rates_LC_DNKf.boot.st <- LCsim_DNKf.boot$rates
+q_LC_DNKf.boot.st <- 1- exp(-rates_LC_DNKf.boot.st)
+q_LC_DNKf.boot.st.ext <-  extrapolation.sim(q_LC_DNKf.boot.st)
+
+
+# Confidence intervals at 90%
+
+# we DNK represent the confidence intervals for the death probs and store them in a df.
+# 1 year death probability
+conf.lev <- 0.9
+q_LC_DNKm.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_DNKm.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_DNKm.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_DNKm.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+    q_LC_DNKm.q95[j,k] <- quantile(q_LC_DNKm.st.ext[j,k,],
+                                   probs=0.5+conf.lev/2)
+    q_LC_DNKm.q05[j,k] <- quantile(q_LC_DNKm.st.ext[j,k,],
+                                   probs=(1-conf.lev)/2)
+    q_LC_DNKm.boot.q95[j,k] <- quantile(q_LC_DNKm.boot.st.ext[j,k,],
+                                        probs=0.5+conf.lev/2)
+    q_LC_DNKm.boot.q05[j,k] <- quantile(q_LC_DNKm.boot.st.ext[j,k,],
+                                        probs=(1-conf.lev)/2)
+  }
+}
+
+q_LC_DNKf.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_DNKf.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_DNKf.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_LC_DNKf.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+    q_LC_DNKf.q95[j,k] <- quantile(q_LC_DNKf.st.ext[j,k,], probs=0.5+conf.lev/2)
+    q_LC_DNKf.q05[j,k] <- quantile(q_LC_DNKf.st.ext[j,k,], probs=(1-conf.lev)/2)
+    q_LC_DNKf.boot.q95[j,k] <- quantile(q_LC_DNKf.boot.st.ext[j,k,], probs=0.5+conf.lev/2)
+    q_LC_DNKf.boot.q05[j,k] <- quantile(q_LC_DNKf.boot.st.ext[j,k,], probs=(1-conf.lev)/2)
+  }
+}
+```
+
+### Actuarial quantities {.tabset}
+
+Finally, we can plot some of the actuarial quantities with the confidence intervals, accounting for parameter uncertainty.As shown by the graphs, the prediction intervals computed with bootstrap, and so that consider parameter uncertainty, is quite similar to the one that does not consider parameter uncertainty only in the case of death probabilities at age 65 for male. The situation is different for female at age 65, due to the fact that the bootstrap prediction interval is quite wider than the other one. This is the case also for death probabilities at age 20 for female. It is important to notice the value of the stochastic annuity and the confidence intervals. Indeed, this can be a very important information for an annuity provider, given that he will face the risk due to the evolution of mortality that can lead to higher life expectancy than expected, and so a greater number of payments for the annuity provider itself. This will mean losses.
+
+#### death probabilities at 65
+```{r, results='hold',fig.width=12, fig.height=13}
+
+# data preparation
+death_probs_ci_m <- tibble(q95 = q_LC_DNKm.q95["65",],
+                           q05 = q_LC_DNKm.q05["65",],
+                           q95boot = q_LC_DNKm.boot.q95["65",],
+                           q05boot = q_LC_DNKm.boot.q05["65",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_m <- death_probs_ci_m %>% gather("value", "rates", 1:4)
+
+death_prob_m <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_LC_DNKm.ext["65",]
+                     )
+
+death_probs_ci_f <- tibble(q95 = q_LC_DNKf.q95["65",],
+                           q05 = q_LC_DNKf.q05["65",],
+                           q95boot = q_LC_DNKf.boot.q95["65",],
+                           q05boot = q_LC_DNKf.boot.q05["65",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_f <- death_probs_ci_f %>%  gather("value", "rates", 1:4)
+
+death_prob_f <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_LC_DNKf.ext["65",]
+                     )
+
+data_deaths_m <- rbind(death_prob_m, death_probs_ci_m)
+data_deaths_f <- rbind(death_prob_f, death_probs_ci_f)
+
+d_p_m <- ggplot(data = data_deaths_m) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 65 + C.I., Male") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+d_p_f <- ggplot(data = data_deaths_f) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 65 + C.I., Female") + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(d_p_m, d_p_f)
+  
+
+```
+
+#### death probabilities at age 20
+
+```{r, results='hold',fig.width=12, fig.height=13}
+
+# data preparation
+death_probs_ci_m <- tibble(q95 = q_LC_DNKm.q95["20",],
+                           q05 = q_LC_DNKm.q05["20",],
+                           q95boot = q_LC_DNKm.boot.q95["20",],
+                           q05boot = q_LC_DNKm.boot.q05["20",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_m <- death_probs_ci_m %>%  gather("value", "rates", 1:4)
+
+death_prob_m <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_LC_DNKm.ext["20",]
+                     )
+
+death_probs_ci_f <- tibble(q95 = q_LC_DNKf.q95["20",],
+                           q05 = q_LC_DNKf.q05["20",],
+                           q95boot = q_LC_DNKf.boot.q95["20",],
+                           q05boot = q_LC_DNKf.boot.q05["20",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_f <- death_probs_ci_f %>%  gather("value", "rates", 1:4)
+
+death_prob_f <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_LC_DNKf.ext["20",]
+                     )
+
+data_deaths_m <- rbind(death_prob_m, death_probs_ci_m)
+data_deaths_f <- rbind(death_prob_f, death_probs_ci_f)
+
+d_p_m <- ggplot(data = data_deaths_m) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 20 + C.I., Male") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+d_p_f <- ggplot(data = data_deaths_f) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 20 + C.I., Female") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(d_p_m, d_p_f)
+  
+
+```
+
+#### Present values of stochastic annuities
+
+```{r, results='hold', fig.width=12, fig.height=13}
+
+p_LC_DNKm.st.ext <- 1-q_LC_DNKm.st.ext # 1 year survival probability
+ann_LC_DNKm.st <- annuity.st(q_LC_DNKm.st.ext,v_vect,0.9)
+ann_LC_DNKm.mean <- ann_LC_DNKm.st[[1]]
+ann_LC_DNKm.q95 <- ann_LC_DNKm.st[[2]]
+ann_LC_DNKm.q05 <- ann_LC_DNKm.st[[3]]
+
+p_LC_DNKf.st.ext <- 1-q_LC_DNKf.st.ext # 1 year survival probability
+ann_LC_DNKf.st <- annuity.st(q_LC_DNKf.st.ext,v_vect,0.9)
+ann_LC_DNKf.mean <- ann_LC_DNKf.st[[1]]
+ann_LC_DNKf.q95 <- ann_LC_DNKf.st[[2]]
+ann_LC_DNKf.q05 <- ann_LC_DNKf.st[[3]]
+
+# data preparation
+
+annuity_male <- tibble(annuity_mean = ann_LC_DNKm.mean["65",],
+                       q05 = ann_LC_DNKm.q05["65",],
+                       q95 = ann_LC_DNKm.q95["65",],
+                       years = seq(2019,2118))
+
+annuity_male <- annuity_male %>% gather("lab", "value", 1:3)
+
+annuity_female <- tibble(annuity_mean = ann_LC_DNKf.mean["65",],
+                       q05 = ann_LC_DNKf.q05["65",],
+                       q95 = ann_LC_DNKf.q95["65",],
+                       years = seq(2019,2118))
+
+annuity_female <- annuity_female %>% gather("lab", "value", 1:3)
+
+
+ann_2050_m <- tibble(annuity_mean = ann_LC_DNKm.mean[,"2050"],
+                       q05 = ann_LC_DNKm.q05[,"2050"],
+                       q95 = ann_LC_DNKm.q95[,"2050"],
+                       ages = seq(0,109))
+
+annuity_2050_m <- ann_2050_m %>% gather("lab", "value", 1:3)
+
+ann_2050_f <- tibble(annuity_mean = ann_LC_DNKf.mean[,"2050"],
+                       q05 = ann_LC_DNKf.q05[,"2050"],
+                       q95 = ann_LC_DNKf.q95[,"2050"],
+                       ages = seq(0,109))
+
+annuity_2050_f <- ann_2050_f %>% gather("lab", "value", 1:3)
+
+
+
+an_male <- ggplot(data = annuity_male) +
+  geom_line(aes(x = years, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity at 65 + C.I., Male") + 
+  theme(legend.position = "right")
+
+an_fem <- ggplot(data = annuity_female) +
+  geom_line(aes(x = years, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity at 65 + C.I., Female") + 
+  theme(legend.position = "right")
+
+
+an_male_2050 <- ggplot(data = annuity_2050_m) +
+  geom_line(aes(x = ages, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity 2050 + C.I., Male") + 
+  theme(legend.position = "right")
+
+an_female_2050 <- ggplot(data = annuity_2050_f) +
+  geom_line(aes(x = ages, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity 2050 + C.I., Female") + 
+  theme(legend.position = "right")
+
+ggarrange(an_male, an_fem, an_male_2050, an_female_2050)
+
+
+```
+
+
+
+
+## APC model
+Note that in this case, the evolution of the period indexes follows an ARIMA(1,1,0) model.
+```{r}
+# male forecasts
+APCfor_DNKm <- forecast(APCfit_DNKm, h=y.pred, gc.order = c(1, 1, 0))
+#female forecasts
+APCfor_DNKf <- forecast(APCfit_DNKf, h=y.pred, gc.order = c(1, 1, 0))
+
+# to be changed!!
+plot(APCfor_DNKm, only.kt = TRUE)
+plot(APCfor_DNKf, only.kt = TRUE)
+plot(APCfor_DNKm, only.gc = TRUE)
+plot(APCfor_DNKf, only.gc = TRUE)
+```
+
+
+### Death rates: last observed vs last projected
+Even in the case of the APC model, it can be represented the evolution of the death rates of the last observed year(2018) compared to the last projected year (2118).
+
+```{r, results='hold'}
+
+
+data_death_rates <- tibble(Ages = c(a.min:a.max), 
+                           last_pred_m=log(APCfor_DNKm$rates[,y.pred]),
+                           last_fit_m=log((APCfit_DNKm$Dxt/APCfit_DNKm$Ext)[,length(Y.fit)]),
+                           last_pred_f=log(APCfor_DNKf$rates[,y.pred]),
+                           last_fit_f=log((APCfit_DNKf$Dxt/APCfit_DNKf$Ext)[,length(Y.fit)])) 
+
+male_death_rates <- ggplot(data = data_death_rates, aes(x = Ages,
+                                     y = last_pred_m), color = "blue") +
+  geom_line() + 
+  
+  xlab("Ages") + 
+  ylab("Death rates") + 
+  theme_economist() +
+  geom_line(data = data_death_rates, aes(x =Ages,
+                           y=last_fit_m),
+            color = "darkcyan", linetype = "dotted") + 
+  labs(subtitle = "evolution of death rates, Female",
+       color = "Legend") 
+  
+
+
+female_death_rates <- ggplot(data = data_death_rates, aes(x = Ages,
+                                     y = last_pred_f), color = "blue") +
+  geom_line() + 
+  
+  xlab("Ages") + 
+  ylab("Death rates") + 
+  theme_economist() +
+  geom_line(data = data_death_rates, aes(x =Ages,
+                           y=last_fit_f),
+            color = "darkcyan", linetype = "dotted") + 
+  labs(subtitle = "evolution of death rates, Male",
+       color = "Legend") 
+
+
+ggarrange(male_death_rates, female_death_rates)
+
+```
+
+In this case, the evolution of the death rates from 2018 to 2118 is quite different from the case of the Lee-Carter model. Indeed, there is a quite low improvement for some young ages (in particular for female), while there is a linear improvement for older ages.
+
+Below is shown the code to obtain the central deaths rates(for both fitted and projected periods). From these, the death probabilities are computed. Also in this case it is used an extrapolation procedure to get the data for population older than 100. 
+
+```{r, results='hold'}
+# male death rates
+rates_APCfit_DNKm <- fitted(APCfit_DNKm, type = "rates")
+rates_APCfor_DNKm <- APCfor_DNKm$rates
+
+# starting from rates, we DNK obtain the death probs
+rates_APC_DNKm <- cbind(DNKmRates,rates_APCfor_DNKm)
+q_APC_DNKm <- 1- exp(-rates_APC_DNKm) # for both past and future
+
+# in order to consider also this pop, we use an extrapolation 
+q_APC_DNKm.ext  <- extrapolation.fit(q_APC_DNKm)
+
+# female death rates
+rates_APCfit_DNKf <- fitted(APCfit_DNKf, type = "rates")
+rates_APCfor_DNKf <- APCfor_DNKf$rates
+rates_APC_DNKf <- cbind(DNKfRates,rates_APCfor_DNKf)
+q_APC_DNKf <- 1- exp(-rates_APC_DNKf)
+q_APC_DNKf.ext  <- extrapolation.fit(q_APC_DNKf)
+
+# create the dataframes
+
+q_APC.DNKm<-tibble(as.data.frame(q_APC_DNKm.ext))
+q_APC.DNKf<-tibble(as.data.frame(q_APC_DNKf.ext))
+
+
+```
+
+### Survival Probabilities and Life expectancies
+
+From death probabilities we can obtain 1 year survival probabilities and survival probabilities for many years as well. Then, below is reported the evolution of the life expectancy at age 0 and 65, for the fitted period as well as the projected one.
+
+```{r, results='hold'}
+# one-year survival probability
+p_APC_DNKm.ext <- 1-q_APC_DNKm.ext 
+# n year survival probability
+p0n_APC_DNKm.ext <- apply(p_APC_DNKm.ext, 2, cumprod) 
+# from death prob we DNK also obtain life expectancy
+ex_APC_DNKm.ext <- life.exp(q_APC_DNKm.ext)
+
+# the same we DNK do for females
+p_APC_DNKf.ext <- 1-q_APC_DNKf.ext 
+p0n_APC_DNKf.ext <- apply(p_APC_DNKf.ext, 2, cumprod) 
+ex_APC_DNKf.ext <- life.exp(q_APC_DNKf.ext)
+
+```
+
+
+
+```{r, results='hold'}
+
+E_birth_m <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_APC_DNKm.ext[1,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at birth, Male") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+E_65_m <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_APC_DNKm.ext[66,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at 65, Male") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+
+E_birth_f <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_APC_DNKf.ext[1,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at birth, Female") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+E_65_f <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_APC_DNKf.ext[66,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at 65, Female") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+ggarrange(E_birth_m, E_65_m, E_birth_f, E_65_f)
+
+```
+
+The graphs show an evolution of the life expectancy at birth and at 65 that is slight different than the case of Lee-Carter. Indeed, the evolution is not linear as in the previous model.
+
+
+### Evolution of death rates
+Up to now it has been considered only the central evolution of death rates. Below are reported the simulated evolution of deaths rates, with the corresponding simulated death probabilities. Then, the evolution of death rates at age 65, 75 and 85 is plotted.
+
+```{r}
+#male
+APCsim_DNKm.mrwd <- simulate(APCfit_DNKm,
+                              nsim = n.sim,
+                              h=y.pred,
+                              gc.order = c(2, 0, 0))
+
+rates_APC_DNKm.st <- APCsim_DNKm.mrwd$rates
+q_APC_DNKm.st <- 1- exp(-rates_APC_DNKm.st)
+q_APC_DNKm.st.ext <-  extrapolation.sim(q_APC_DNKm.st)
+
+# female
+APCsim_DNKf.mrwd <- simulate(APCfit_DNKf,
+                              nsim = n.sim,
+                              h=y.pred,
+                              gc.order = c(2, 0, 0))
+
+rates_APC_DNKf.st <- APCsim_DNKf.mrwd$rates
+q_APC_DNKf.st <- 1- exp(-rates_APC_DNKf.st)
+q_APC_DNKf.st.ext <-  extrapolation.sim(q_APC_DNKf.st)
+
+# fun charts
+probs = c(2.5, 10, 25, 50, 75, 90, 97.5)
+par(mfrow=c(1, 2))
+matplot(APCfit_DNKm$years,
+        t(q_APC_DNKm[c("65", "75", "85"),
+                    c(1:length(Y.fit)) ]),
+        xlim = c(y.fit.min, (y.fit.min+y.pred)),
+        ylim = c(0.001, 0.2),
+        pch = 20, col = "black",
+        log = "y",
+        xlab = "year",
+        ylab = "male mortality rate (log scale)")
+fan(t(APCsim_DNKm.mrwd$rates["65", , ]),
+    start = y.fit.max+1,
+    probs = probs, n.fan = 4,
+    fan.col = colorRampPalette(c("black", "white")),
+    ln = NULL)
+fan(t(APCsim_DNKm.mrwd$rates["75", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("red", "white")),
+    ln = NULL)
+fan(t(APCsim_DNKm.mrwd$rates["85", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("blue", "white")),
+    ln = NULL)
+text(y.fit.min+4,
+     q_APC_DNKm[c("65", "75", "85"), 30],
+     labels = c("x = 65", "x = 75", "x = 85"))
+matplot(APCfit_DNKf$years,
+        t(q_APC_DNKf[c("65", "75", "85"),
+                    c(1:length(Y.fit)) ]),
+        xlim = c(y.fit.min, (y.fit.min+y.pred)),
+        ylim = c(0.001, 0.2),
+        pch = 20, col = "black",
+        log = "y", xlab = "year", ylab = "female mortality rate (log scale)")
+fan(t(APCsim_DNKf.mrwd$rates["65", , ]),
+    start = y.fit.max+1,
+    probs = probs, n.fan = 4,
+    fan.col = colorRampPalette(c("black", "white")),
+    ln = NULL)
+fan(t(APCsim_DNKf.mrwd$rates["75", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("red", "white")),
+    ln = NULL)
+fan(t(APCsim_DNKf.mrwd$rates["85", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("blue", "white")), ln = NULL)
+text(y.fit.min+4,
+     q_APC_DNKf[c("65", "75", "85"), 30],
+     labels = c("x = 65", "x = 75", "x = 85"))
+
+```
+
+
+### Bootstrap
+
+Even in the case of the APC model, a semiparametric bootstrap has been implemented.
+
+```{r}
+APCboot_DNKm <- bootstrap(APCfit_DNKm,
+                         nBoot = n.boot,
+                         type = "semiparametric")
+APCsim_DNKm.boot <- simulate(APCboot_DNKm, nsim = n.sim/n.boot, h = y.pred)
+rates_APC_DNKm.boot.st <- APCsim_DNKm.boot$rates
+q_APC_DNKm.boot.st <- 1- exp(-rates_APC_DNKm.boot.st)
+q_APC_DNKm.boot.st.ext <-  extrapolation.sim(q_APC_DNKm.boot.st)
+
+APCboot_DNKf <- bootstrap(APCfit_DNKf,
+                         nBoot = n.boot,
+                         type = "semiparametric")
+APCsim_DNKf.boot <- simulate(APCboot_DNKf, nsim = n.sim/n.boot, h = y.pred)
+rates_APC_DNKf.boot.st <- APCsim_DNKf.boot$rates
+q_APC_DNKf.boot.st <- 1- exp(-rates_APC_DNKf.boot.st)
+q_APC_DNKf.boot.st.ext <-  extrapolation.sim(q_APC_DNKf.boot.st)
+
+
+# Confidence intervals at 90%
+
+# we DNK represent the confidence intervals for the death probs and store them in a df.
+# 1 year death probability
+conf.lev <- 0.9
+q_APC_DNKm.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_APC_DNKm.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_APC_DNKm.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_APC_DNKm.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+    q_APC_DNKm.q95[j,k] <- quantile(q_APC_DNKm.st.ext[j,k,],
+                                   probs=0.5+conf.lev/2)
+    q_APC_DNKm.q05[j,k] <- quantile(q_APC_DNKm.st.ext[j,k,],
+                                   probs=(1-conf.lev)/2)
+    q_APC_DNKm.boot.q95[j,k] <- quantile(q_APC_DNKm.boot.st.ext[j,k,],
+                                        probs=0.5+conf.lev/2)
+    q_APC_DNKm.boot.q05[j,k] <- quantile(q_APC_DNKm.boot.st.ext[j,k,],
+                                        probs=(1-conf.lev)/2)
+  }
+}
+
+q_APC_DNKf.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_APC_DNKf.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_APC_DNKf.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_APC_DNKf.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+    q_APC_DNKf.q95[j,k] <- quantile(q_APC_DNKf.st.ext[j,k,], probs=0.5+conf.lev/2)
+    q_APC_DNKf.q05[j,k] <- quantile(q_APC_DNKf.st.ext[j,k,], probs=(1-conf.lev)/2)
+    q_APC_DNKf.boot.q95[j,k] <- quantile(q_APC_DNKf.boot.st.ext[j,k,], probs=0.5+conf.lev/2)
+    q_APC_DNKf.boot.q05[j,k] <- quantile(q_APC_DNKf.boot.st.ext[j,k,], probs=(1-conf.lev)/2)
+  }
+}
+```
+
+
+### Actuarial quantities {.tabset}
+
+Finally, we can plot some of the actuarial quantities with the confidence intervals, accounting for parameter uncertainty. According to the APC model, the prediction intervals including parameter uncertainty are not so wide with respect to the ones that does not consider it, for both male and female and for death probabilities at age 65 and 20. This means that the parameter uncertainty has a not so relevant impact on the prediction intervals.
+
+#### death probabilities at 65
+```{r, results='hold',fig.width=12, fig.height=13}
+
+# data preparation
+death_probs_ci_m <- tibble(q95 = q_APC_DNKm.q95["65",],
+                           q05 = q_APC_DNKm.q05["65",],
+                           q95boot = q_APC_DNKm.boot.q95["65",],
+                           q05boot = q_APC_DNKm.boot.q05["65",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_m <- death_probs_ci_m %>%  gather("value", "rates", 1:4)
+
+death_prob_m <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_APC_DNKm.ext["65",]
+                     )
+
+death_probs_ci_f <- tibble(q95 = q_APC_DNKf.q95["65",],
+                           q05 = q_APC_DNKf.q05["65",],
+                           q95boot = q_APC_DNKf.boot.q95["65",],
+                           q05boot = q_APC_DNKf.boot.q05["65",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_f <- death_probs_ci_f %>%  gather("value", "rates", 1:4)
+
+death_prob_f <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_APC_DNKf.ext["65",]
+                     )
+
+data_deaths_m <- rbind(death_prob_m, death_probs_ci_m)
+data_deaths_f <- rbind(death_prob_f, death_probs_ci_f)
+
+d_p_m <- ggplot(data = data_deaths_m) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 65 + C.I., Male") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+d_p_f <- ggplot(data = data_deaths_f) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 65 + C.I., Female") + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(d_p_m, d_p_f)
+  
+
+```
+
+
+#### death probabilities at age 20
+
+```{r, results='hold',fig.width=12, fig.height=13}
+
+# data preparation
+death_probs_ci_m <- tibble(q95 = q_APC_DNKm.q95["20",],
+                           q05 = q_APC_DNKm.q05["20",],
+                           q95boot = q_APC_DNKm.boot.q95["20",],
+                           q05boot = q_APC_DNKm.boot.q05["20",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_m <- death_probs_ci_m %>%  gather("value", "rates", 1:4)
+
+death_prob_m <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_APC_DNKm.ext["20",]
+                     )
+
+death_probs_ci_f <- tibble(q95 = q_APC_DNKf.q95["20",],
+                           q05 = q_APC_DNKf.q05["20",],
+                           q95boot = q_APC_DNKf.boot.q95["20",],
+                           q05boot = q_APC_DNKf.boot.q05["20",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_f <- death_probs_ci_f %>%  gather("value", "rates", 1:4)
+
+death_prob_f <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_APC_DNKf.ext["20",]
+                     )
+
+data_deaths_m <- rbind(death_prob_m, death_probs_ci_m)
+data_deaths_f <- rbind(death_prob_f, death_probs_ci_f)
+
+d_p_m <- ggplot(data = data_deaths_m) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 20 + C.I., Male") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+d_p_f <- ggplot(data = data_deaths_f) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 20 + C.I., Female") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(d_p_m, d_p_f)
+  
+
+```
+
+
+#### Present values of stochastic annuities
+
+```{r, results='hold', fig.width=12, fig.height=13}
+
+p_APC_DNKm.st.ext <- 1-q_APC_DNKm.st.ext # 1 year survival probability
+ann_APC_DNKm.st <- annuity.st(q_APC_DNKm.st.ext,v_vect,0.9)
+ann_APC_DNKm.mean <- ann_APC_DNKm.st[[1]]
+ann_APC_DNKm.q95 <- ann_APC_DNKm.st[[2]]
+ann_APC_DNKm.q05 <- ann_APC_DNKm.st[[3]]
+
+p_APC_DNKf.st.ext <- 1-q_APC_DNKf.st.ext # 1 year survival probability
+ann_APC_DNKf.st <- annuity.st(q_APC_DNKf.st.ext,v_vect,0.9)
+ann_APC_DNKf.mean <- ann_APC_DNKf.st[[1]]
+ann_APC_DNKf.q95 <- ann_APC_DNKf.st[[2]]
+ann_APC_DNKf.q05 <- ann_APC_DNKf.st[[3]]
+
+# data preparation
+
+annuity_male <- tibble(annuity_mean = ann_APC_DNKm.mean["65",],
+                       q05 = ann_APC_DNKm.q05["65",],
+                       q95 = ann_APC_DNKm.q95["65",],
+                       years = seq(2019,2118))
+
+annuity_male <- annuity_male %>% gather("lab", "value", 1:3)
+
+annuity_female <- tibble(annuity_mean = ann_APC_DNKf.mean["65",],
+                       q05 = ann_APC_DNKf.q05["65",],
+                       q95 = ann_APC_DNKf.q95["65",],
+                       years = seq(2019,2118))
+
+annuity_female <- annuity_female %>% gather("lab", "value", 1:3)
+
+
+ann_2050_m <- tibble(annuity_mean = ann_APC_DNKm.mean[,"2050"],
+                       q05 = ann_APC_DNKm.q05[,"2050"],
+                       q95 = ann_APC_DNKm.q95[,"2050"],
+                       ages = seq(0,109))
+
+annuity_2050_m <- ann_2050_m %>% gather("lab", "value", 1:3)
+
+ann_2050_f <- tibble(annuity_mean = ann_APC_DNKf.mean[,"2050"],
+                       q05 = ann_APC_DNKf.q05[,"2050"],
+                       q95 = ann_APC_DNKf.q95[,"2050"],
+                       ages = seq(0,109))
+
+annuity_2050_f <- ann_2050_f %>% gather("lab", "value", 1:3)
+
+
+
+an_male <- ggplot(data = annuity_male) +
+  geom_line(aes(x = years, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity at 65 + C.I., Male") + 
+  theme(legend.position = "right")
+
+an_fem <- ggplot(data = annuity_female) +
+  geom_line(aes(x = years, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity at 65 + C.I., Female") + 
+  theme(legend.position = "right")
+
+
+an_male_2050 <- ggplot(data = annuity_2050_m) +
+  geom_line(aes(x = ages, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity 2050 + C.I., Male") + 
+  theme(legend.position = "right")
+
+an_female_2050 <- ggplot(data = annuity_2050_f) +
+  geom_line(aes(x = ages, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity 2050 + C.I., Female") + 
+  theme(legend.position = "right")
+
+ggarrange(an_male, an_fem, an_male_2050, an_female_2050)
+
+
+```
+
+
+
+
+## Plat model.
+As previously mentioned, it combines the CBD model with some features of the Lee-Carter model to produce a model that is suitable for full age ranges and captures the cohort effect. For the cohort effect of the Plat model it  has been used an ARIMA(2,0,0) model. Then it is shown a fan chart that represents the forecast for the period indexes, with a central forecast and a 95% prediction intervals. In addition, the fan charts with the confidence interval for the cohort indexes are shown.
+
+```{r}
+# male forecasts
+PLATfor_DNKm <- forecast(PLATfit_DNKm, h=y.pred, gc.order = c(2, 0, 0))
+#female forecasts
+PLATfor_DNKf <- forecast(PLATfit_DNKf, h=y.pred, gc.order = c(2, 0, 0))
+
+# to be changed!!
+plot(PLATfor_DNKm, only.kt = TRUE)
+plot(PLATfor_DNKf, only.kt = TRUE)
+plot(PLATfor_DNKm, only.gc = TRUE)
+plot(PLATfor_DNKf, only.gc = TRUE)
+```
+
+
+### Death rates: last observed vs last projected
+Even in the case of the PLAT model, it can be represented the evolution of the death rates of the last observed year(2018) compared to the last projected year (2118).
+
+```{r, results='hold'}
+
+
+data_death_rates <- tibble(Ages = c(a.min:a.max), 
+                           last_pred_m=log(PLATfor_DNKm$rates[,y.pred]),
+                           last_fit_m=log((PLATfit_DNKm$Dxt/PLATfit_DNKm$Ext)[,length(Y.fit)]),
+                           last_pred_f=log(PLATfor_DNKf$rates[,y.pred]),
+                           last_fit_f=log((PLATfit_DNKf$Dxt/PLATfit_DNKf$Ext)[,length(Y.fit)])) 
+
+male_death_rates <- ggplot(data = data_death_rates, aes(x = Ages,
+                                     y = last_pred_m), color = "blue") +
+  geom_line() + 
+  
+  xlab("Ages") + 
+  ylab("Death rates") + 
+  theme_economist() +
+  geom_line(data = data_death_rates, aes(x =Ages,
+                           y=last_fit_m),
+            color = "darkcyan", linetype = "dotted") + 
+  labs(subtitle = "evolution of death rates, Female",
+       color = "Legend") 
+  
+
+
+female_death_rates <- ggplot(data = data_death_rates, aes(x = Ages,
+                                     y = last_pred_f), color = "blue") +
+  geom_line() + 
+  
+  xlab("Ages") + 
+  ylab("Death rates") + 
+  theme_economist() +
+  geom_line(data = data_death_rates, aes(x =Ages,
+                           y=last_fit_f),
+            color = "darkcyan", linetype = "dotted") + 
+  labs(subtitle = "evolution of death rates, Male",
+       color = "Legend") 
+
+
+ggarrange(male_death_rates, female_death_rates)
+
+```
+
+Even in the case of the PLAT model, the evolution of the death rates from the last fitted year to the last projected year shows a particular improvement for younger ages, but as soon as older ages are considered, the improvements become smaller and smaller, until reach almost 0 at very old ages.
+
+Below is shown the code to obtain the central deaths rates(for both fitted and projected periods). From these, the death probabilities are computed. Also in this case it is used an extrapolation procedure to get the data for population older than 100. 
+
+```{r, results='hold'}
+# male death rates
+rates_PLATfit_DNKm <- fitted(PLATfit_DNKm, type = "rates")
+rates_PLATfor_DNKm <- PLATfor_DNKm$rates
+
+# starting from rates, we DNK obtain the death probs
+rates_PLAT_DNKm <- cbind(DNKmRates,rates_PLATfor_DNKm)
+q_PLAT_DNKm <- 1- exp(-rates_PLAT_DNKm) # for both past and future
+
+# in order to consider also this pop, we use an extrapolation 
+q_PLAT_DNKm.ext  <- extrapolation.fit(q_PLAT_DNKm)
+
+# female death rates
+rates_PLATfit_DNKf <- fitted(PLATfit_DNKf, type = "rates")
+rates_PLATfor_DNKf <- PLATfor_DNKf$rates
+rates_PLAT_DNKf <- cbind(DNKfRates,rates_PLATfor_DNKf)
+q_PLAT_DNKf <- 1- exp(-rates_PLAT_DNKf)
+q_PLAT_DNKf.ext  <- extrapolation.fit(q_PLAT_DNKf)
+
+# create the dataframes
+
+q_PLAT.DNKm<-tibble(as.data.frame(q_PLAT_DNKm.ext))
+q_PLAT.DNKf<-tibble(as.data.frame(q_PLAT_DNKf.ext))
+
+
+```
+
+### Survival Probabilities and Life expectancies
+
+From death probabilities we can obtain 1 year survival probabilities and survival probabilities for many years as well. Then, below is reported the evolution of the life expectancy at age 0 and 65, for the fitted period as well as the projected one.
+
+```{r, results='hold'}
+# one-year survival probability
+p_PLAT_DNKm.ext <- 1-q_PLAT_DNKm.ext 
+# n year survival probability
+p0n_PLAT_DNKm.ext <- apply(p_PLAT_DNKm.ext, 2, cumprod) 
+# from death prob we DNK also obtain life expectancy
+ex_PLAT_DNKm.ext <- life.exp(q_PLAT_DNKm.ext)
+
+# the same we DNK do for females
+p_PLAT_DNKf.ext <- 1-q_PLAT_DNKf.ext 
+p0n_PLAT_DNKf.ext <- apply(p_PLAT_DNKf.ext, 2, cumprod) 
+ex_PLAT_DNKf.ext <- life.exp(q_PLAT_DNKf.ext)
+
+```
+
+
+
+```{r, results='hold'}
+
+E_birth_m <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_PLAT_DNKm.ext[1,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at birth, Male") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+E_65_m <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_PLAT_DNKm.ext[66,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at 65, Male") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+
+E_birth_f <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_PLAT_DNKf.ext[1,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at birth, Female") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+E_65_f <- ggplot(data=NULL, aes(x = c(1968:2118) , y = ex_PLAT_DNKf.ext[66,])) + 
+  geom_line() + 
+  labs(subtitle = "Life Expectancy at 65, Female") + 
+  xlab("Years") + 
+  ylab("Life expectancy") +
+  theme_economist()
+
+ggarrange(E_birth_m, E_65_m, E_birth_f, E_65_f)
+
+```
+
+The graphs show an evolution of the life expectancy different from the one of the Lee-Carter model. Indeed, in the case of the Plat model, there is no a linear evolution of life expectancy as in the case of Lee-Carter. This suggests that the PLAT model account for unexpected events, such as epidemics and so on.
+
+
+### Evolution of death rates
+Up to now it has been considered only the central evolution of death rates. Below are reported the simulated evolution of deaths rates, with the corresponding simulated death probabilities. Then, the evolution of death rates at age 65, 75 and 85 is plotted.
+
+```{r}
+#male
+PLATsim_DNKm.mrwd <- simulate(PLATfit_DNKm,
+                              nsim = n.sim,
+                              h=y.pred,
+                              gc.order = c(2, 0, 0))
+
+rates_PLAT_DNKm.st <- PLATsim_DNKm.mrwd$rates
+q_PLAT_DNKm.st <- 1- exp(-rates_PLAT_DNKm.st)
+q_PLAT_DNKm.st.ext <-  extrapolation.sim(q_PLAT_DNKm.st)
+
+# female
+PLATsim_DNKf.mrwd <- simulate(PLATfit_DNKf,
+                              nsim = n.sim,
+                              h=y.pred,
+                              gc.order = c(2, 0, 0))
+
+rates_PLAT_DNKf.st <- PLATsim_DNKf.mrwd$rates
+q_PLAT_DNKf.st <- 1- exp(-rates_PLAT_DNKf.st)
+q_PLAT_DNKf.st.ext <-  extrapolation.sim(q_PLAT_DNKf.st)
+
+# fun charts
+probs = c(2.5, 10, 25, 50, 75, 90, 97.5)
+par(mfrow=c(1, 2))
+matplot(PLATfit_DNKm$years,
+        t(q_PLAT_DNKm[c("65", "75", "85"),
+                    c(1:length(Y.fit)) ]),
+        xlim = c(y.fit.min, (y.fit.min+y.pred)),
+        ylim = c(0.001, 0.2),
+        pch = 20, col = "black",
+        log = "y",
+        xlab = "year",
+        ylab = "male mortality rate (log scale)")
+fan(t(PLATsim_DNKm.mrwd$rates["65", , ]),
+    start = y.fit.max+1,
+    probs = probs, n.fan = 4,
+    fan.col = colorRampPalette(c("black", "white")),
+    ln = NULL)
+fan(t(PLATsim_DNKm.mrwd$rates["75", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("red", "white")),
+    ln = NULL)
+fan(t(PLATsim_DNKm.mrwd$rates["85", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("blue", "white")),
+    ln = NULL)
+text(y.fit.min+4,
+     q_PLAT_DNKm[c("65", "75", "85"), 30],
+     labels = c("x = 65", "x = 75", "x = 85"))
+matplot(PLATfit_DNKf$years,
+        t(q_PLAT_DNKf[c("65", "75", "85"),
+                    c(1:length(Y.fit)) ]),
+        xlim = c(y.fit.min, (y.fit.min+y.pred)),
+        ylim = c(0.001, 0.2),
+        pch = 20, col = "black",
+        log = "y", xlab = "year", ylab = "female mortality rate (log scale)")
+fan(t(PLATsim_DNKf.mrwd$rates["65", , ]),
+    start = y.fit.max+1,
+    probs = probs, n.fan = 4,
+    fan.col = colorRampPalette(c("black", "white")),
+    ln = NULL)
+fan(t(PLATsim_DNKf.mrwd$rates["75", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("red", "white")),
+    ln = NULL)
+fan(t(PLATsim_DNKf.mrwd$rates["85", , ]),
+    start = y.fit.max+1,
+    probs = probs,
+    n.fan = 4,
+    fan.col = colorRampPalette(c("blue", "white")), ln = NULL)
+text(y.fit.min+4,
+     q_PLAT_DNKf[c("65", "75", "85"), 30],
+     labels = c("x = 65", "x = 75", "x = 85"))
+
+```
+
+
+### Bootstrap
+
+Even in the case of the Plat model, a semiparametric bootstrap has been implemented.
+
+```{r}
+PLATboot_DNKm <- bootstrap(PLATfit_DNKm,
+                         nBoot = n.boot,
+                         type = "semiparametric")
+PLATsim_DNKm.boot <- simulate(PLATboot_DNKm, nsim = n.sim/n.boot, h = y.pred)
+rates_PLAT_DNKm.boot.st <- PLATsim_DNKm.boot$rates
+q_PLAT_DNKm.boot.st <- 1- exp(-rates_PLAT_DNKm.boot.st)
+q_PLAT_DNKm.boot.st.ext <-  extrapolation.sim(q_PLAT_DNKm.boot.st)
+
+PLATboot_DNKf <- bootstrap(PLATfit_DNKf,
+                         nBoot = n.boot,
+                         type = "semiparametric")
+PLATsim_DNKf.boot <- simulate(PLATboot_DNKf, nsim = n.sim/n.boot, h = y.pred)
+rates_PLAT_DNKf.boot.st <- PLATsim_DNKf.boot$rates
+q_PLAT_DNKf.boot.st <- 1- exp(-rates_PLAT_DNKf.boot.st)
+q_PLAT_DNKf.boot.st.ext <-  extrapolation.sim(q_PLAT_DNKf.boot.st)
+
+
+# Confidence intervals at 90%
+
+# we DNK represent the confidence intervals for the death probs and store them in a df.
+# 1 year death probability
+conf.lev <- 0.9
+q_PLAT_DNKm.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_PLAT_DNKm.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_PLAT_DNKm.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_PLAT_DNKm.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+    q_PLAT_DNKm.q95[j,k] <- quantile(q_PLAT_DNKm.st.ext[j,k,],
+                                   probs=0.5+conf.lev/2)
+    q_PLAT_DNKm.q05[j,k] <- quantile(q_PLAT_DNKm.st.ext[j,k,],
+                                   probs=(1-conf.lev)/2)
+    q_PLAT_DNKm.boot.q95[j,k] <- quantile(q_PLAT_DNKm.boot.st.ext[j,k,],
+                                        probs=0.5+conf.lev/2)
+    q_PLAT_DNKm.boot.q05[j,k] <- quantile(q_PLAT_DNKm.boot.st.ext[j,k,],
+                                        probs=(1-conf.lev)/2)
+  }
+}
+
+q_PLAT_DNKf.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_PLAT_DNKf.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_PLAT_DNKf.boot.q95 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+q_PLAT_DNKf.boot.q05 <- matrix(0, nrow=(omega-a.min),ncol=y.pred, dimnames=list(c(a.min:(omega-1)), c((tail(Y.fit,1)+1):(tail(Y.fit,1)+y.pred))))
+for (j in 1:(omega-a.min)){
+  for (k in 1:y.pred){
+    q_PLAT_DNKf.q95[j,k] <- quantile(q_PLAT_DNKf.st.ext[j,k,], probs=0.5+conf.lev/2)
+    q_PLAT_DNKf.q05[j,k] <- quantile(q_PLAT_DNKf.st.ext[j,k,], probs=(1-conf.lev)/2)
+    q_PLAT_DNKf.boot.q95[j,k] <- quantile(q_PLAT_DNKf.boot.st.ext[j,k,], probs=0.5+conf.lev/2)
+    q_PLAT_DNKf.boot.q05[j,k] <- quantile(q_PLAT_DNKf.boot.st.ext[j,k,], probs=(1-conf.lev)/2)
+  }
+}
+```
+
+
+### Actuarial quantities {.tabset}
+
+Finally, we can plot some of the actuarial quantities with the confidence intervals, accounting for parameter uncertainty. In the PLAT model, the confidence intervals computed by taking into account the parameter uncertainty are wider in both the death probabilities at age 65 and 20 and for both male and female, but the intervals start to become wider from 2080 on. The parameter uncertainty has an important impact on the prediction intervals
+
+#### death probabilities at 65
+```{r, results='hold',fig.width=12, fig.height=13}
+
+# data preparation
+death_probs_ci_m <- tibble(q95 = q_PLAT_DNKm.q95["65",],
+                           q05 = q_PLAT_DNKm.q05["65",],
+                           q95boot = q_PLAT_DNKm.boot.q95["65",],
+                           q05boot = q_PLAT_DNKm.boot.q05["65",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_m <- death_probs_ci_m %>%  gather("value", "rates", 1:4)
+
+death_prob_m <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_PLAT_DNKm.ext["65",]
+                     )
+
+death_probs_ci_f <- tibble(q95 = q_PLAT_DNKf.q95["65",],
+                           q05 = q_PLAT_DNKf.q05["65",],
+                           q95boot = q_PLAT_DNKf.boot.q95["65",],
+                           q05boot = q_PLAT_DNKf.boot.q05["65",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_f <- death_probs_ci_f %>%  gather("value", "rates", 1:4)
+
+death_prob_f <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_PLAT_DNKf.ext["65",]
+                     )
+
+data_deaths_m <- rbind(death_prob_m, death_probs_ci_m)
+data_deaths_f <- rbind(death_prob_f, death_probs_ci_f)
+
+d_p_m <- ggplot(data = data_deaths_m) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 65 + C.I., Male") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+d_p_f <- ggplot(data = data_deaths_f) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 65 + C.I., Female") + 
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(d_p_m, d_p_f)
+  
+
+```
+
+
+#### death probabilities at age 20
+
+```{r, results='hold',fig.width=12, fig.height=13}
+
+# data preparation
+death_probs_ci_m <- tibble(q95 = q_PLAT_DNKm.q95["20",],
+                           q05 = q_PLAT_DNKm.q05["20",],
+                           q95boot = q_PLAT_DNKm.boot.q95["20",],
+                           q05boot = q_PLAT_DNKm.boot.q05["20",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_m <- death_probs_ci_m %>%  gather("value", "rates", 1:4)
+
+death_prob_m <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_PLAT_DNKm.ext["20",]
+                     )
+
+death_probs_ci_f <- tibble(q95 = q_PLAT_DNKf.q95["20",],
+                           q05 = q_PLAT_DNKf.q05["20",],
+                           q95boot = q_PLAT_DNKf.boot.q95["20",],
+                           q05boot = q_PLAT_DNKf.boot.q05["20",],
+                           years =seq(2019,2118),
+                           )
+
+
+death_probs_ci_f <- death_probs_ci_f %>%  gather("value", "rates", 1:4)
+
+death_prob_f <- tibble(years = seq(1968,2118),
+                     value = "qx",
+                     rates = q_PLAT_DNKf.ext["20",]
+                     )
+
+data_deaths_m <- rbind(death_prob_m, death_probs_ci_m)
+data_deaths_f <- rbind(death_prob_f, death_probs_ci_f)
+
+d_p_m <- ggplot(data = data_deaths_m) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 20 + C.I., Male") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+d_p_f <- ggplot(data = data_deaths_f) + 
+  geom_line( aes(x = years, y = rates, colour = value)) +
+   theme_economist() +
+  labs(subtitle = "death probabilities at 20 + C.I., Female") +
+  theme(legend.position = "right",
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+
+
+
+ggarrange(d_p_m, d_p_f)
+  
+
+```
+
+
+#### Present values of stochastic annuities
+
+```{r, results='hold', fig.width=12, fig.height=13}
+
+p_PLAT_DNKm.st.ext <- 1-q_PLAT_DNKm.st.ext # 1 year survival probability
+ann_PLAT_DNKm.st <- annuity.st(q_PLAT_DNKm.st.ext,v_vect,0.9)
+ann_PLAT_DNKm.mean <- ann_PLAT_DNKm.st[[1]]
+ann_PLAT_DNKm.q95 <- ann_PLAT_DNKm.st[[2]]
+ann_PLAT_DNKm.q05 <- ann_PLAT_DNKm.st[[3]]
+
+p_PLAT_DNKf.st.ext <- 1-q_PLAT_DNKf.st.ext # 1 year survival probability
+ann_PLAT_DNKf.st <- annuity.st(q_PLAT_DNKf.st.ext,v_vect,0.9)
+ann_PLAT_DNKf.mean <- ann_PLAT_DNKf.st[[1]]
+ann_PLAT_DNKf.q95 <- ann_PLAT_DNKf.st[[2]]
+ann_PLAT_DNKf.q05 <- ann_PLAT_DNKf.st[[3]]
+
+# data preparation
+
+annuity_male <- tibble(annuity_mean = ann_PLAT_DNKm.mean["65",],
+                       q05 = ann_PLAT_DNKm.q05["65",],
+                       q95 = ann_PLAT_DNKm.q95["65",],
+                       years = seq(2019,2118))
+
+annuity_male <- annuity_male %>% gather("lab", "value", 1:3)
+
+annuity_female <- tibble(annuity_mean = ann_PLAT_DNKf.mean["65",],
+                       q05 = ann_PLAT_DNKf.q05["65",],
+                       q95 = ann_PLAT_DNKf.q95["65",],
+                       years = seq(2019,2118))
+
+annuity_female <- annuity_female %>% gather("lab", "value", 1:3)
+
+
+ann_2050_m <- tibble(annuity_mean = ann_PLAT_DNKm.mean[,"2050"],
+                       q05 = ann_PLAT_DNKm.q05[,"2050"],
+                       q95 = ann_PLAT_DNKm.q95[,"2050"],
+                       ages = seq(0,109))
+
+annuity_2050_m <- ann_2050_m %>% gather("lab", "value", 1:3)
+
+ann_2050_f <- tibble(annuity_mean = ann_PLAT_DNKf.mean[,"2050"],
+                       q05 = ann_PLAT_DNKf.q05[,"2050"],
+                       q95 = ann_PLAT_DNKf.q95[,"2050"],
+                       ages = seq(0,109))
+
+annuity_2050_f <- ann_2050_f %>% gather("lab", "value", 1:3)
+
+
+
+an_male <- ggplot(data = annuity_male) +
+  geom_line(aes(x = years, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity at 65 + C.I., Male") + 
+  theme(legend.position = "right")
+
+an_fem <- ggplot(data = annuity_female) +
+  geom_line(aes(x = years, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity at 65 + C.I., Female") + 
+  theme(legend.position = "right")
+
+
+an_male_2050 <- ggplot(data = annuity_2050_m) +
+  geom_line(aes(x = ages, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity 2050 + C.I., Male") + 
+  theme(legend.position = "right")
+
+an_female_2050 <- ggplot(data = annuity_2050_f) +
+  geom_line(aes(x = ages, y = value, color = lab)) +  
+   theme_economist() +
+  labs(subtitle = "stochastic annuity 2050 + C.I., Female") + 
+  theme(legend.position = "right")
+
+ggarrange(an_male, an_fem, an_male_2050, an_female_2050)
+
+
+```
+
+
+
+
